@@ -14,7 +14,11 @@ import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.TextView
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
+import java.io.File
 import java.io.InputStreamReader
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class PddAccessibilityService : AccessibilityService() {
 
@@ -29,6 +33,7 @@ class PddAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         loadDatabase()
+        logLine("=== Сервис запущен === База: ${questions.size}, неоднозначных: ${ambiguousQuestionKeys.size}")
     }
 
     private fun loadDatabase() {
@@ -45,7 +50,9 @@ class PddAccessibilityService : AccessibilityService() {
                 if (corrects.size > 1) ambiguous.add(q)
             }
             ambiguousQuestionKeys = ambiguous
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            logLine("Ошибка загрузки базы: ${e.message}")
+        }
     }
 
     private fun normalizeText(text: String): String {
@@ -62,7 +69,18 @@ class PddAccessibilityService : AccessibilityService() {
         if (event == null) return
         if (event.packageName == packageName) return
 
-        val root = rootInActiveWindow ?: return
+        val root = rootInActiveWindow
+        if (root == null) {
+            // Диагностика: возможно защита
+            val sb = StringBuilder()
+            sb.append("\n=== ${SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())} ===\n")
+            sb.append("Пакет: ${event.packageName}\n")
+            sb.append("root = null (возможна защита или нет активного окна)\n")
+            logLine(sb.toString())
+            hideBadge()
+            return
+        }
+
         val allNodes = mutableListOf<AccessibilityNodeInfo>()
         traverseNode(root, allNodes)
 
@@ -78,8 +96,35 @@ class PddAccessibilityService : AccessibilityService() {
             textNodes.add(TextNode(n, norm, r))
         }
         val screenTexts = textNodes.map { it.norm }
-        if (screenTexts.isEmpty()) { hideBadge(); return }
 
+        // === Диагностика: если текстов нет, но узлы есть ===
+        if (screenTexts.isEmpty()) {
+            val sb = StringBuilder()
+            sb.append("\n=== ${SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())} ===\n")
+            sb.append("Пакет: ${event.packageName}\n")
+            sb.append("Узлов: ${allNodes.size}, текстовых: 0\n")
+            sb.append("Причина: текст не читается через accessibility.\n")
+            sb.append("Возможные защиты:\n")
+            sb.append("  • FLAG_SECURE на окне\n")
+            sb.append("  • WebView без accessibility\n")
+            sb.append("  • Canvas/SurfaceView\n")
+            sb.append("  • Кастомные View без text\n")
+
+            // Смотрим, что есть в узлах: contentDescription, viewIdResourceName, className
+            sb.append("Первые 15 узлов (className / viewId / contentDesc / text):\n")
+            allNodes.take(15).forEachIndexed { idx, n ->
+                val cn = n.className?.toString() ?: "?"
+                val vid = n.viewIdResourceName ?: "-"
+                val cd = n.contentDescription?.toString() ?: "-"
+                val tx = n.text?.toString() ?: "-"
+                sb.append("  [$idx] $cn | $vid | cd='$cd' | text='$tx'\n")
+            }
+            logLine(sb.toString())
+            hideBadge()
+            return
+        }
+
+        // === Поиск кандидатов ===
         val candidates = mutableListOf<PddQuestion>()
         for (q in questions) {
             val nq = normalizeText(q.question)
@@ -105,26 +150,29 @@ class PddAccessibilityService : AccessibilityService() {
 
         if (correctNode == null) { hideBadge(); return }
 
-        // === Ищем номер правильного ответа ===
         val answerNumber = findAnswerNumber(correctNode, allNodes)
-        val dotPos = findBadgePosition(correctNode)
+        val pos = findBadgePosition(correctNode)
 
-        showBadge(answerNumber, dotPos.first, dotPos.second)
+        val sb = StringBuilder()
+        sb.append("\n=== ${SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())} ===\n")
+        sb.append("Пакет: ${event.packageName}\n")
+        sb.append("Вопрос: '${candidates.first().question}'\n")
+        sb.append("Правильный: '$correctNorm' под номером $answerNumber\n")
+        sb.append("Позиция бейджа: ($pos)\n")
+        logLine(sb.toString())
+
+        showBadge(answerNumber, pos.first, pos.second)
     }
 
-    // Ищем цифру ответа (соседний слева узел или по позиции)
     private fun findAnswerNumber(correct: TextNode, allNodes: List<AccessibilityNodeInfo>): String {
-        // Ищем среди всех узлов-цифр тот, который ближе всего слева от правильного ответа
         var bestNum: String? = null
         var bestDist = Int.MAX_VALUE
-
         for (n in allNodes) {
             val t = n.text?.toString()?.trim() ?: continue
             if (!t.matches(Regex("^\\d+\\.?$"))) continue
             val r = Rect()
             n.getBoundsInScreen(r)
             if (r.width() <= 0) continue
-            // Цифра должна быть выше или на той же высоте, слева
             if (r.centerY() > correct.rect.centerY() + 20) continue
             val dist = correct.rect.left - r.right
             if (dist in 0..200 && dist < bestDist) {
@@ -135,9 +183,8 @@ class PddAccessibilityService : AccessibilityService() {
         return bestNum ?: "?"
     }
 
-    // Позиция для бейджа — слева от цифры
     private fun findBadgePosition(correct: TextNode): Pair<Int, Int> {
-        val size = 40
+        val size = 30
         val parent = correct.node.parent
         if (parent != null) {
             var leftmost = correct.rect.left
@@ -150,9 +197,9 @@ class PddAccessibilityService : AccessibilityService() {
                     if (r.width() > 0 && r.left < leftmost) leftmost = r.left
                 }
             }
-            return Pair(leftmost - size - 8, correct.rect.centerY() - size / 2)
+            return Pair(leftmost - size - 6, correct.rect.centerY() - size / 2)
         }
-        return Pair(correct.rect.left - size - 8, correct.rect.centerY() - size / 2)
+        return Pair(correct.rect.left - size - 6, correct.rect.centerY() - size / 2)
     }
 
     private fun questionMatches(qNorm: String, screenTexts: List<String>): Boolean {
@@ -171,15 +218,15 @@ class PddAccessibilityService : AccessibilityService() {
     }
 
     private fun showBadge(number: String, x: Int, y: Int) {
-        val size = 40
+        val size = 30
         if (badgeView == null) {
             badgeView = TextView(this).apply {
                 setTextColor(Color.WHITE)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
                 gravity = Gravity.CENTER
                 background = GradientDrawable().apply {
                     shape = GradientDrawable.OVAL
-                    setColor(Color.parseColor("#CC0000")) // красный кружок
+                    setColor(Color.parseColor("#888888")) // серый
                 }
             }
             val params = WindowManager.LayoutParams(
@@ -210,6 +257,18 @@ class PddAccessibilityService : AccessibilityService() {
 
     override fun onInterrupt() { hideBadge() }
     override fun onDestroy() { super.onDestroy(); hideBadge() }
+
+    private fun logLine(text: String) {
+        try {
+            val file = File(getExternalFilesDir(null), LOG_FILENAME)
+            if (file.exists() && file.length() > 500_000) file.writeText("")
+            file.appendText(text)
+        } catch (_: Exception) {}
+    }
+
+    companion object {
+        const val LOG_FILENAME = "pdd_log.txt"
+    }
 }
 
 data class PddQuestion(val question: String, val answers: List<String>, val correct_answer: String)
