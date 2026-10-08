@@ -16,7 +16,7 @@ class PddAccessibilityService : AccessibilityService() {
 
     private lateinit var windowManager: WindowManager
     private var dotView: View? = null
-    private var questionMap: Map<String, String> = emptyMap()
+    private var questions: List<PddQuestion> = emptyList()
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -24,27 +24,21 @@ class PddAccessibilityService : AccessibilityService() {
         loadDatabase()
     }
 
-    // Загружаем базу вопросов из assets/questions.json
     private fun loadDatabase() {
         try {
             val inputStream = assets.open("questions.json")
             val reader = InputStreamReader(inputStream)
             val type = object : TypeToken<List<PddQuestion>>() {}.type
-            val questions: List<PddQuestion> = Gson().fromJson(reader, type)
-
-            // Строим Map: нормализованный текст вопроса -> нормализованный правильный ответ
-            questionMap = questions.associate {
-                normalizeText(it.question) to normalizeText(it.correct_answer)
-            }
+            questions = Gson().fromJson(reader, type)
+            android.util.Log.d("PDD", "Загружено вопросов: ${questions.size}")
         } catch (e: Exception) {
-            e.printStackTrace()
+            android.util.Log.e("PDD", "Ошибка загрузки базы: ${e.message}")
         }
     }
 
-    // Нормализация текста: нижний регистр, убираем лишние символы
     private fun normalizeText(text: String): String {
         return text.lowercase()
-            .replace(Regex("[^a-zа-я0-9 ]"), "")
+            .replace(Regex("[^a-zа-яё0-9 ]"), "")
             .replace(Regex("\\s+"), " ")
             .trim()
     }
@@ -52,41 +46,55 @@ class PddAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val rootNode = rootInActiveWindow ?: return
 
-        // 1. Собираем все узлы текущего экрана
         val allNodes = mutableListOf<AccessibilityNodeInfo>()
         traverseNode(rootNode, allNodes)
 
-        val screenTexts = allNodes.mapNotNull { it.text?.toString() }
+        // Собираем нормализованные тексты всех узлов
+        val screenTexts = allNodes.mapNotNull { node ->
+            val text = node.text?.toString()?.let { normalizeText(it) }
+            if (text.isNullOrEmpty()) null else text
+        }
 
-        // 2. Ищем вопрос из базы среди текстов на экране
-        var correctAnswer = ""
-        for (text in screenTexts) {
-            val normalized = normalizeText(text)
-            if (questionMap.containsKey(normalized)) {
-                correctAnswer = questionMap[normalized] ?: ""
+        // Ищем совпадение по вопросу + ответам
+        var matchedQuestion: PddQuestion? = null
+
+        for (question in questions) {
+            val normQuestion = normalizeText(question.question)
+            if (normQuestion.isEmpty()) continue
+
+            // Есть ли текст вопроса на экране?
+            if (!screenTexts.any { it == normQuestion }) continue
+
+            // Есть ли ВСЕ варианты ответов этого вопроса на экране?
+            val allAnswersFound = question.answers.all { answer ->
+                val normAnswer = normalizeText(answer)
+                normAnswer.isNotEmpty() && screenTexts.any { it == normAnswer }
+            }
+
+            if (allAnswersFound) {
+                matchedQuestion = question
                 break
             }
         }
 
-        // 3. Если нашли правильный ответ — ищем его координаты и показываем точку
-        if (correctAnswer.isNotEmpty()) {
+        // Если совпадение найдено — ищем координаты правильного ответа
+        if (matchedQuestion != null) {
+            val correctAnswerNorm = normalizeText(matchedQuestion.correct_answer)
             val correctNode = allNodes.find {
-                normalizeText(it.text?.toString() ?: "") == correctAnswer
+                normalizeText(it.text?.toString() ?: "") == correctAnswerNorm
             }
 
             if (correctNode != null) {
                 val rect = Rect()
                 correctNode.getBoundsInScreen(rect)
                 showDot(rect)
-            } else {
-                hideDot()
+                return
             }
-        } else {
-            hideDot()
         }
+
+        hideDot()
     }
 
-    // Рекурсивный обход дерева элементов
     private fun traverseNode(node: AccessibilityNodeInfo?, nodes: MutableList<AccessibilityNodeInfo>) {
         if (node == null) return
         nodes.add(node)
@@ -95,7 +103,6 @@ class PddAccessibilityService : AccessibilityService() {
         }
     }
 
-    // Рисуем или перемещаем зелёную точку
     private fun showDot(rect: Rect) {
         if (dotView == null) {
             dotView = View(this).apply {
@@ -120,23 +127,17 @@ class PddAccessibilityService : AccessibilityService() {
 
     private fun hideDot() {
         if (dotView != null) {
-            windowManager.removeView(dotView)
+            try { windowManager.removeView(dotView) } catch (e: Exception) {}
             dotView = null
         }
     }
 
-    override fun onInterrupt() {
-        hideDot()
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        hideDot()
-    }
+    override fun onInterrupt() { hideDot() }
+    override fun onDestroy() { super.onDestroy(); hideDot() }
 }
 
-// Модель данных для парсинга JSON
 data class PddQuestion(
     val question: String,
+    val answers: List<String>,
     val correct_answer: String
 )
