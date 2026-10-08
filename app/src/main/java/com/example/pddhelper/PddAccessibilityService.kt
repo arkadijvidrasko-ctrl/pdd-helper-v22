@@ -12,7 +12,11 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
+import java.io.File
 import java.io.InputStreamReader
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class PddAccessibilityService : AccessibilityService() {
 
@@ -21,12 +25,18 @@ class PddAccessibilityService : AccessibilityService() {
     private var questions: List<PddQuestion> = emptyList()
     private var ambiguousQuestionKeys: Set<String> = emptySet()
 
-    private data class TextNode(val norm: String, val rect: Rect)
+    private data class TextNode(
+        val node: AccessibilityNodeInfo,
+        val norm: String,
+        val rect: Rect
+    )
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         loadDatabase()
+        logLine("=== Сервис запущен ===")
+        logLine("База: ${questions.size} вопросов, неоднозначных: ${ambiguousQuestionKeys.size}")
     }
 
     private fun loadDatabase() {
@@ -43,7 +53,9 @@ class PddAccessibilityService : AccessibilityService() {
                 if (corrects.size > 1) ambiguous.add(q)
             }
             ambiguousQuestionKeys = ambiguous
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            logLine("ОШИБКА загрузки базы: ${e.message}")
+        }
     }
 
     private fun normalizeText(text: String): String {
@@ -57,7 +69,15 @@ class PddAccessibilityService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        val root = rootInActiveWindow ?: return
+        if (event == null) return
+        // Не реагируем на своё приложение
+        if (event.packageName == packageName) return
+
+        val root = rootInActiveWindow
+        if (root == null) {
+            logLine("root=null, событие от ${event.packageName}")
+            return
+        }
 
         val allNodes = mutableListOf<AccessibilityNodeInfo>()
         traverseNode(root, allNodes)
@@ -71,12 +91,27 @@ class PddAccessibilityService : AccessibilityService() {
             val r = Rect()
             n.getBoundsInScreen(r)
             if (r.width() <= 0 || r.height() <= 0) continue
-            textNodes.add(TextNode(norm, r))
+            textNodes.add(TextNode(n, norm, r))
         }
         val screenTexts = textNodes.map { it.norm }
 
-        if (screenTexts.isEmpty()) { hideDot(); return }
+        // === ЛОГ: что видим на экране ===
+        val sb = StringBuilder()
+        sb.append("\n=== ${SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())} ===\n")
+        sb.append("Пакет: ${event.packageName}\n")
+        sb.append("Узлов: ${allNodes.size}, текстовых: ${textNodes.size}\n")
 
+        if (screenTexts.isEmpty()) {
+            sb.append("❌ Текст не читается (возможна защита)\n")
+            logLine(sb.toString())
+            hideDot()
+            return
+        }
+
+        sb.append("Видимые тексты (первые 12):\n")
+        screenTexts.take(12).forEach { sb.append("   · $it\n") }
+
+        // === Поиск кандидатов ===
         val candidates = mutableListOf<PddQuestion>()
         for (q in questions) {
             val nq = normalizeText(q.question)
@@ -90,23 +125,68 @@ class PddAccessibilityService : AccessibilityService() {
             if (allAnswersOnScreen) candidates.add(q)
         }
 
-        if (candidates.isEmpty()) { hideDot(); return }
+        sb.append("Кандидатов по вопросу+ответам: ${candidates.size}\n")
+        candidates.forEach { sb.append("   ▶ '${it.question}' → '${it.correct_answer}'\n") }
+
+        if (candidates.isEmpty()) {
+            logLine(sb.toString())
+            hideDot()
+            return
+        }
 
         val distinctCorrect = candidates.map { normalizeText(it.correct_answer) }.distinct()
-        if (distinctCorrect.size != 1) { hideDot(); return }
+        if (distinctCorrect.size != 1) {
+            sb.append("⚠ Неоднозначно (${distinctCorrect.size} разных ответов) — пропуск\n")
+            logLine(sb.toString())
+            hideDot()
+            return
+        }
 
         val correctNorm = distinctCorrect[0]
         val correctNode = textNodes
             .filter { it.norm == correctNorm }
             .minByOrNull { it.rect.top }
 
-        if (correctNode == null) { hideDot(); return }
+        if (correctNode == null) {
+            sb.append("❌ Ответ '$correctNorm' не найден среди узлов экрана\n")
+            logLine(sb.toString())
+            hideDot()
+            return
+        }
 
-        val r = correctNode.rect
+        // === Ищем цифру ответа рядом (сосед по родителю) ===
+        val dotPos = findDotPosition(correctNode)
+
+        sb.append("✅ ВЫБРАНО: '$correctNorm'\n")
+        sb.append("   текст ответа: ${correctNode.rect}\n")
+        sb.append("   точка в: ($dotPos)\n")
+        logLine(sb.toString())
+
+        showDot(dotPos.first, dotPos.second, 12)
+    }
+
+    // Возвращает (x, y) для точки
+    private fun findDotPosition(correct: TextNode): Pair<Int, Int> {
         val dotSize = 12
-        val x = r.left - dotSize - 8
-        val y = r.top + 10
-        showDot(x, y, dotSize)
+
+        // Попытка 1: найти соседа-родителя с цифрой ("1.", "2.")
+        val parent = correct.node.parent
+        if (parent != null) {
+            var leftmost = correct.rect.left
+            for (i in 0 until parent.childCount) {
+                val sib = parent.getChild(i) ?: continue
+                val t = sib.text?.toString()?.trim() ?: continue
+                if (t.matches(Regex("^\\d+\\.?$"))) {
+                    val r = Rect()
+                    sib.getBoundsInScreen(r)
+                    if (r.width() > 0 && r.left < leftmost) leftmost = r.left
+                }
+            }
+            return Pair(leftmost - dotSize - 8, correct.rect.centerY() - dotSize / 2)
+        }
+
+        // Fallback: просто слева от текста
+        return Pair(correct.rect.left - dotSize - 8, correct.rect.centerY() - dotSize / 2)
     }
 
     private fun questionMatches(qNorm: String, screenTexts: List<String>): Boolean {
@@ -159,6 +239,18 @@ class PddAccessibilityService : AccessibilityService() {
 
     override fun onInterrupt() { hideDot() }
     override fun onDestroy() { super.onDestroy(); hideDot() }
+
+    private fun logLine(text: String) {
+        try {
+            val file = File(getExternalFilesDir(null), LOG_FILENAME)
+            if (file.exists() && file.length() > 300_000) file.writeText("")
+            file.appendText(text)
+        } catch (_: Exception) {}
+    }
+
+    companion object {
+        const val LOG_FILENAME = "pdd_log.txt"
+    }
 }
 
 data class PddQuestion(
