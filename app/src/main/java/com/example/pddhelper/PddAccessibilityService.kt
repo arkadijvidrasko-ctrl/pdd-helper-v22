@@ -5,38 +5,30 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
+import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.widget.TextView
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
-import java.io.File
 import java.io.InputStreamReader
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 class PddAccessibilityService : AccessibilityService() {
 
     private lateinit var windowManager: WindowManager
-    private var dotView: View? = null
+    private var badgeView: TextView? = null
     private var questions: List<PddQuestion> = emptyList()
     private var ambiguousQuestionKeys: Set<String> = emptySet()
 
-    private data class TextNode(
-        val node: AccessibilityNodeInfo,
-        val norm: String,
-        val rect: Rect
-    )
+    private data class TextNode(val node: AccessibilityNodeInfo, val norm: String, val rect: Rect)
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         loadDatabase()
-        logLine("=== Сервис запущен ===")
-        logLine("База: ${questions.size} вопросов, неоднозначных: ${ambiguousQuestionKeys.size}")
     }
 
     private fun loadDatabase() {
@@ -53,9 +45,7 @@ class PddAccessibilityService : AccessibilityService() {
                 if (corrects.size > 1) ambiguous.add(q)
             }
             ambiguousQuestionKeys = ambiguous
-        } catch (e: Exception) {
-            logLine("ОШИБКА загрузки базы: ${e.message}")
-        }
+        } catch (_: Exception) {}
     }
 
     private fun normalizeText(text: String): String {
@@ -70,15 +60,9 @@ class PddAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
-        // Не реагируем на своё приложение
         if (event.packageName == packageName) return
 
-        val root = rootInActiveWindow
-        if (root == null) {
-            logLine("root=null, событие от ${event.packageName}")
-            return
-        }
-
+        val root = rootInActiveWindow ?: return
         val allNodes = mutableListOf<AccessibilityNodeInfo>()
         traverseNode(root, allNodes)
 
@@ -94,24 +78,8 @@ class PddAccessibilityService : AccessibilityService() {
             textNodes.add(TextNode(n, norm, r))
         }
         val screenTexts = textNodes.map { it.norm }
+        if (screenTexts.isEmpty()) { hideBadge(); return }
 
-        // === ЛОГ: что видим на экране ===
-        val sb = StringBuilder()
-        sb.append("\n=== ${SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())} ===\n")
-        sb.append("Пакет: ${event.packageName}\n")
-        sb.append("Узлов: ${allNodes.size}, текстовых: ${textNodes.size}\n")
-
-        if (screenTexts.isEmpty()) {
-            sb.append("❌ Текст не читается (возможна защита)\n")
-            logLine(sb.toString())
-            hideDot()
-            return
-        }
-
-        sb.append("Видимые тексты (первые 12):\n")
-        screenTexts.take(12).forEach { sb.append("   · $it\n") }
-
-        // === Поиск кандидатов ===
         val candidates = mutableListOf<PddQuestion>()
         for (q in questions) {
             val nq = normalizeText(q.question)
@@ -125,51 +93,51 @@ class PddAccessibilityService : AccessibilityService() {
             if (allAnswersOnScreen) candidates.add(q)
         }
 
-        sb.append("Кандидатов по вопросу+ответам: ${candidates.size}\n")
-        candidates.forEach { sb.append("   ▶ '${it.question}' → '${it.correct_answer}'\n") }
-
-        if (candidates.isEmpty()) {
-            logLine(sb.toString())
-            hideDot()
-            return
-        }
+        if (candidates.isEmpty()) { hideBadge(); return }
 
         val distinctCorrect = candidates.map { normalizeText(it.correct_answer) }.distinct()
-        if (distinctCorrect.size != 1) {
-            sb.append("⚠ Неоднозначно (${distinctCorrect.size} разных ответов) — пропуск\n")
-            logLine(sb.toString())
-            hideDot()
-            return
-        }
+        if (distinctCorrect.size != 1) { hideBadge(); return }
 
         val correctNorm = distinctCorrect[0]
         val correctNode = textNodes
             .filter { it.norm == correctNorm }
             .minByOrNull { it.rect.top }
 
-        if (correctNode == null) {
-            sb.append("❌ Ответ '$correctNorm' не найден среди узлов экрана\n")
-            logLine(sb.toString())
-            hideDot()
-            return
-        }
+        if (correctNode == null) { hideBadge(); return }
 
-        // === Ищем цифру ответа рядом (сосед по родителю) ===
-        val dotPos = findDotPosition(correctNode)
+        // === Ищем номер правильного ответа ===
+        val answerNumber = findAnswerNumber(correctNode, allNodes)
+        val dotPos = findBadgePosition(correctNode)
 
-        sb.append("✅ ВЫБРАНО: '$correctNorm'\n")
-        sb.append("   текст ответа: ${correctNode.rect}\n")
-        sb.append("   точка в: ($dotPos)\n")
-        logLine(sb.toString())
-
-        showDot(dotPos.first, dotPos.second, 12)
+        showBadge(answerNumber, dotPos.first, dotPos.second)
     }
 
-    // Возвращает (x, y) для точки
-    private fun findDotPosition(correct: TextNode): Pair<Int, Int> {
-        val dotSize = 12
+    // Ищем цифру ответа (соседний слева узел или по позиции)
+    private fun findAnswerNumber(correct: TextNode, allNodes: List<AccessibilityNodeInfo>): String {
+        // Ищем среди всех узлов-цифр тот, который ближе всего слева от правильного ответа
+        var bestNum: String? = null
+        var bestDist = Int.MAX_VALUE
 
-        // Попытка 1: найти соседа-родителя с цифрой ("1.", "2.")
+        for (n in allNodes) {
+            val t = n.text?.toString()?.trim() ?: continue
+            if (!t.matches(Regex("^\\d+\\.?$"))) continue
+            val r = Rect()
+            n.getBoundsInScreen(r)
+            if (r.width() <= 0) continue
+            // Цифра должна быть выше или на той же высоте, слева
+            if (r.centerY() > correct.rect.centerY() + 20) continue
+            val dist = correct.rect.left - r.right
+            if (dist in 0..200 && dist < bestDist) {
+                bestDist = dist
+                bestNum = t.replace(".", "").trim()
+            }
+        }
+        return bestNum ?: "?"
+    }
+
+    // Позиция для бейджа — слева от цифры
+    private fun findBadgePosition(correct: TextNode): Pair<Int, Int> {
+        val size = 40
         val parent = correct.node.parent
         if (parent != null) {
             var leftmost = correct.rect.left
@@ -182,11 +150,9 @@ class PddAccessibilityService : AccessibilityService() {
                     if (r.width() > 0 && r.left < leftmost) leftmost = r.left
                 }
             }
-            return Pair(leftmost - dotSize - 8, correct.rect.centerY() - dotSize / 2)
+            return Pair(leftmost - size - 8, correct.rect.centerY() - size / 2)
         }
-
-        // Fallback: просто слева от текста
-        return Pair(correct.rect.left - dotSize - 8, correct.rect.centerY() - dotSize / 2)
+        return Pair(correct.rect.left - size - 8, correct.rect.centerY() - size / 2)
     }
 
     private fun questionMatches(qNorm: String, screenTexts: List<String>): Boolean {
@@ -204,12 +170,16 @@ class PddAccessibilityService : AccessibilityService() {
         for (i in 0 until node.childCount) traverseNode(node.getChild(i), out)
     }
 
-    private fun showDot(x: Int, y: Int, size: Int) {
-        if (dotView == null) {
-            dotView = View(this).apply {
+    private fun showBadge(number: String, x: Int, y: Int) {
+        val size = 40
+        if (badgeView == null) {
+            badgeView = TextView(this).apply {
+                setTextColor(Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                gravity = Gravity.CENTER
                 background = GradientDrawable().apply {
                     shape = GradientDrawable.OVAL
-                    setColor(Color.parseColor("#888888"))
+                    setColor(Color.parseColor("#CC0000")) // красный кружок
                 }
             }
             val params = WindowManager.LayoutParams(
@@ -220,41 +190,26 @@ class PddAccessibilityService : AccessibilityService() {
                 PixelFormat.TRANSLUCENT
             )
             params.gravity = Gravity.TOP or Gravity.START
-            windowManager.addView(dotView, params)
+            windowManager.addView(badgeView, params)
         }
-        val params = dotView?.layoutParams as WindowManager.LayoutParams
+        badgeView?.text = number
+        val params = badgeView?.layoutParams as WindowManager.LayoutParams
         params.width = size
         params.height = size
         params.x = x
         params.y = y
-        windowManager.updateViewLayout(dotView, params)
+        windowManager.updateViewLayout(badgeView, params)
     }
 
-    private fun hideDot() {
-        if (dotView != null) {
-            try { windowManager.removeView(dotView) } catch (_: Exception) {}
-            dotView = null
+    private fun hideBadge() {
+        if (badgeView != null) {
+            try { windowManager.removeView(badgeView) } catch (_: Exception) {}
+            badgeView = null
         }
     }
 
-    override fun onInterrupt() { hideDot() }
-    override fun onDestroy() { super.onDestroy(); hideDot() }
-
-    private fun logLine(text: String) {
-        try {
-            val file = File(getExternalFilesDir(null), LOG_FILENAME)
-            if (file.exists() && file.length() > 300_000) file.writeText("")
-            file.appendText(text)
-        } catch (_: Exception) {}
-    }
-
-    companion object {
-        const val LOG_FILENAME = "pdd_log.txt"
-    }
+    override fun onInterrupt() { hideBadge() }
+    override fun onDestroy() { super.onDestroy(); hideBadge() }
 }
 
-data class PddQuestion(
-    val question: String,
-    val answers: List<String>,
-    val correct_answer: String
-)
+data class PddQuestion(val question: String, val answers: List<String>, val correct_answer: String)
