@@ -12,20 +12,13 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
-import java.io.File
 import java.io.InputStreamReader
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 class PddAccessibilityService : AccessibilityService() {
 
     private lateinit var windowManager: WindowManager
     private var dotView: View? = null
     private var questions: List<PddQuestion> = emptyList()
-
-    // Набор «текстов вопросов, по которым в базе разные правильные ответы» —
-    // для таких вопросов мы молчим, чтобы не соврать.
     private var ambiguousQuestionKeys: Set<String> = emptySet()
 
     private data class TextNode(val norm: String, val rect: Rect)
@@ -34,7 +27,6 @@ class PddAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         loadDatabase()
-        log("Сервис запущен. Вопросов: ${questions.size}, неоднозначных: ${ambiguousQuestionKeys.size}")
     }
 
     private fun loadDatabase() {
@@ -44,7 +36,6 @@ class PddAccessibilityService : AccessibilityService() {
                 val type = object : TypeToken<List<PddQuestion>>() {}.type
                 questions = Gson().fromJson(reader, type)
             }
-            // Считаем неоднозначные вопросы: те, у которых одинаковый вопрос, но разные ответы
             val byQuestion = questions.groupBy { normalizeText(it.question) }
             val ambiguous = mutableSetOf<String>()
             for ((q, list) in byQuestion) {
@@ -52,9 +43,7 @@ class PddAccessibilityService : AccessibilityService() {
                 if (corrects.size > 1) ambiguous.add(q)
             }
             ambiguousQuestionKeys = ambiguous
-        } catch (e: Exception) {
-            log("ОШИБКА загрузки базы: ${e.message}")
-        }
+        } catch (_: Exception) {}
     }
 
     private fun normalizeText(text: String): String {
@@ -86,16 +75,13 @@ class PddAccessibilityService : AccessibilityService() {
         }
         val screenTexts = textNodes.map { it.norm }
 
-        if (screenTexts.isEmpty()) {
-            hideDot()
-            return
-        }
+        if (screenTexts.isEmpty()) { hideDot(); return }
 
         val candidates = mutableListOf<PddQuestion>()
         for (q in questions) {
             val nq = normalizeText(q.question)
             if (nq.length < 10) continue
-            if (ambiguousQuestionKeys.contains(nq)) continue  // неоднозначный — не трогаем
+            if (ambiguousQuestionKeys.contains(nq)) continue
             if (!questionMatches(nq, screenTexts)) continue
             val allAnswersOnScreen = q.answers.all { a ->
                 val na = normalizeText(a)
@@ -104,47 +90,22 @@ class PddAccessibilityService : AccessibilityService() {
             if (allAnswersOnScreen) candidates.add(q)
         }
 
-        if (candidates.isEmpty()) {
-            hideDot()
-            return
-        }
+        if (candidates.isEmpty()) { hideDot(); return }
 
-        val sb = StringBuilder()
-        sb.append("=== ${SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())} ===\n")
-        sb.append("Экран (до 10 строк):\n")
-        screenTexts.take(10).forEach { sb.append("  · $it\n") }
-        sb.append("Кандидатов: ${candidates.size}\n")
-        candidates.forEach { sb.append("  ▶ '${it.question}' -> '${it.correct_answer}'\n") }
-
-        // Если у кандидатов разные правильные ответы — молчим
         val distinctCorrect = candidates.map { normalizeText(it.correct_answer) }.distinct()
-        if (distinctCorrect.size != 1) {
-            sb.append("Неоднозначно (${distinctCorrect.size} разных), пропуск\n\n")
-            log(sb.toString())
-            hideDot()
-            return
-        }
+        if (distinctCorrect.size != 1) { hideDot(); return }
 
         val correctNorm = distinctCorrect[0]
         val correctNode = textNodes
             .filter { it.norm == correctNorm }
             .minByOrNull { it.rect.top }
 
-        if (correctNode == null) {
-            sb.append("Ответ '$correctNorm' не найден на экране\n\n")
-            log(sb.toString())
-            hideDot()
-            return
-        }
+        if (correctNode == null) { hideDot(); return }
 
-        sb.append("ВЫБРАНО: '$correctNorm' @ ${correctNode.rect}\n\n")
-        log(sb.toString())
-
-        // Точка слева от цифры ответа, по верху первой строки
         val r = correctNode.rect
         val dotSize = 12
-        val x = r.left - dotSize - 8       // 8px отступ от начала текста
-        val y = r.top + 10                 // чуть ниже верха строки — примерно центр цифры
+        val x = r.left - dotSize - 8
+        val y = r.top + 10
         showDot(x, y, dotSize)
     }
 
@@ -198,18 +159,6 @@ class PddAccessibilityService : AccessibilityService() {
 
     override fun onInterrupt() { hideDot() }
     override fun onDestroy() { super.onDestroy(); hideDot() }
-
-    private fun log(text: String) {
-        try {
-            val file = File(getExternalFilesDir(null), LOG_FILENAME)
-            if (file.exists() && file.length() > 200_000) file.writeText("")
-            file.appendText(text)
-        } catch (_: Exception) {}
-    }
-
-    companion object {
-        const val LOG_FILENAME = "pdd_log.txt"
-    }
 }
 
 data class PddQuestion(
