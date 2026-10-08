@@ -58,13 +58,13 @@ class PddAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val root = rootInActiveWindow ?: return
 
-        // 1. Собираем все текстовые узлы (только листья, без контейнеров)
+        // ======= ШАГ 1. Собираем тексты и их координаты =======
         val allNodes = mutableListOf<AccessibilityNodeInfo>()
         traverseNode(root, allNodes)
 
         val textNodes = mutableListOf<TextNode>()
         for (n in allNodes) {
-            if (n.childCount > 0) continue
+            if (n.childCount > 0) continue                // только листья (реальные TextView)
             val raw = n.text?.toString() ?: continue
             val norm = normalizeText(raw)
             if (norm.isEmpty()) continue
@@ -73,10 +73,9 @@ class PddAccessibilityService : AccessibilityService() {
             if (r.width() <= 0 || r.height() <= 0) continue
             textNodes.add(TextNode(n, norm, r))
         }
-
         val screenTexts = textNodes.map { it.norm }
 
-        // 2. Ищем кандидатов: вопрос совпал по началу + все ответы есть на экране
+        // ======= ШАГ 2 и 3. Ищем вопрос, у которого и текст, и все ответы есть на экране =======
         val candidates = mutableListOf<PddQuestion>()
         for (q in questions) {
             val nq = normalizeText(q.question)
@@ -84,25 +83,26 @@ class PddAccessibilityService : AccessibilityService() {
 
             if (!questionOnScreen(nq, screenTexts)) continue
 
-            val allAnswersFound = q.answers.all { a ->
+            val allAnswersOnScreen = q.answers.all { a ->
                 val na = normalizeText(a)
                 na.isNotEmpty() && screenTexts.any { it == na }
             }
-            if (allAnswersFound) candidates.add(q)
+            if (allAnswersOnScreen) candidates.add(q)
         }
 
-        // 3. Если у кандидатов разные правильные ответы — не показываем ничего
+        // ======= ШАГ 4. Проверяем однозначность =======
+        // Если разные кандидаты дают разные правильные ответы — молчим (не гадаем).
         val distinctCorrect = candidates.map { normalizeText(it.correct_answer) }.distinct()
         if (distinctCorrect.size != 1) {
             hideDot()
             return
         }
-
         val correctNorm = distinctCorrect[0]
 
-        // 4. Ищем узел правильного ответа, берём самый верхний
-        val correctNode = textNodes.filter { it.norm == correctNorm }
-            .minByOrNull { it.rect.top }
+        // ======= ШАГ 5. Ищем текст правильного ответа на экране =======
+        val correctNode = textNodes
+            .filter { it.norm == correctNorm }
+            .minByOrNull { it.rect.top }   // берём самый верхний, если вдруг дубликат
 
         if (correctNode == null) {
             hideDot()
@@ -113,11 +113,9 @@ class PddAccessibilityService : AccessibilityService() {
         showDot(correctNode.rect)
     }
 
-    // Проверяем, есть ли текст вопроса на экране (по началу)
+    // Проверяем, есть ли текст вопроса на экране (по началу, если текст обрезан)
     private fun questionOnScreen(qNorm: String, screenTexts: List<String>): Boolean {
-        // Полное совпадение
         if (screenTexts.any { it == qNorm }) return true
-        // Префикс: если какой-то узел содержит первые 25 символов вопроса
         val prefix = qNorm.take(25)
         if (prefix.length < 8) return false
         return screenTexts.any { it.contains(prefix) }
@@ -129,8 +127,9 @@ class PddAccessibilityService : AccessibilityService() {
         for (i in 0 until node.childCount) traverseNode(node.getChild(i), out)
     }
 
+    // ======= Рисуем серый кружок 10×10 слева от текста ответа =======
     private fun showDot(rect: Rect) {
-        val dotSize = 10  // маленький кружок 10x10 px
+        val dotSize = 10
 
         if (dotView == null) {
             dotView = View(this).apply {
@@ -151,7 +150,7 @@ class PddAccessibilityService : AccessibilityService() {
         }
 
         val params = dotView?.layoutParams as WindowManager.LayoutParams
-        // Точка слева от текста ответа, по вертикальному центру строки
+        // Слева от начала текста ответа, по вертикальному центру строки
         params.x = rect.left - 18
         params.y = rect.centerY() - dotSize / 2
         windowManager.updateViewLayout(dotView, params)
