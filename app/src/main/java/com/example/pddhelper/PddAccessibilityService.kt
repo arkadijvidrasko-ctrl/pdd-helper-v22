@@ -15,7 +15,6 @@ import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.TextView
-import com.google.android.gms.tasks.Task
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import com.google.mlkit.vision.common.InputImage
@@ -39,7 +38,6 @@ class PddAccessibilityService : AccessibilityService() {
     private var ocrInProgress = false
 
     private data class TextNode(val node: AccessibilityNodeInfo, val norm: String, val rect: Rect)
-    private data class OcrLine(val norm: String, val rect: Rect)
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -79,7 +77,11 @@ class PddAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
-        if (event.packageName == packageName) return
+
+        // КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: packageName возвращает CharSequence,
+        // приводим к String, иначе компилятор ругается
+        val pkg: String = event.packageName?.toString() ?: return
+        if (pkg == packageName) return
 
         val root = rootInActiveWindow
         if (root == null) { hideBadge(); return }
@@ -101,16 +103,13 @@ class PddAccessibilityService : AccessibilityService() {
         val screenTexts = textNodes.map { it.norm }
 
         if (screenTexts.isNotEmpty()) {
-            // Обычный путь: текст читается через accessibility
-            processScreen(event.packageName, textNodes.map { it.norm to it.rect })
+            processScreen(pkg, textNodes.map { it.norm to it.rect })
             return
         }
 
-        // Текст не читается — пробуем OCR
-        tryOcr(event.packageName)
+        tryOcr(pkg)
     }
 
-    // === Обычная логика (по accessibility) ===
     private fun processScreen(pkg: String, lines: List<Pair<String, Rect>>) {
         val screenTexts = lines.map { it.first }
         val candidates = findCandidates(screenTexts)
@@ -122,14 +121,14 @@ class PddAccessibilityService : AccessibilityService() {
 
         val correctLine = lines
             .filter { it.first == correctNorm }
-            .minByOrNull { it.second.top } ?: run { hideBadge(); return }
+            .minByOrNull { it.second.top }
+        if (correctLine == null) { hideBadge(); return }
 
         val answerNumber = findAnswerNumberFromTexts(correctLine.second, lines)
         val pos = Pair(correctLine.second.left - 36, correctLine.second.centerY() - 15)
         showBadge(answerNumber, pos.first, pos.second)
     }
 
-    // === OCR-путь ===
     private fun tryOcr(pkg: String) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
             hideBadge()
@@ -172,7 +171,8 @@ class PddAccessibilityService : AccessibilityService() {
                 for (block in visionText.textBlocks) {
                     for (line in block.lines) {
                         val r = line.boundingBox ?: continue
-                        val norm = normalizeText(line.text)
+                        val text = line.text
+                        val norm = normalizeText(text)
                         if (norm.length < 2) continue
                         lines.add(norm to r)
                     }
@@ -229,7 +229,6 @@ class PddAccessibilityService : AccessibilityService() {
         showBadge(answerNumber, pos.first, pos.second)
     }
 
-    // Общий поиск кандидатов по списку нормализованных строк
     private fun findCandidates(screenTexts: List<String>): List<PddQuestion> {
         val out = mutableListOf<PddQuestion>()
         for (q in questions) {
@@ -239,7 +238,7 @@ class PddAccessibilityService : AccessibilityService() {
             if (!questionMatches(nq, screenTexts)) continue
             val allAnswersOnScreen = q.answers.all { a ->
                 val na = normalizeText(a)
-                na.isNotEmpty() && screenTexts.any { it == na || it.contains(na) || na.contains(it) && it.length > 8 }
+                na.isNotEmpty() && screenTexts.any { it == na || it.contains(na) || (na.contains(it) && it.length > 8) }
             }
             if (allAnswersOnScreen) out.add(q)
         }
@@ -248,9 +247,8 @@ class PddAccessibilityService : AccessibilityService() {
 
     private fun questionMatches(qNorm: String, screenTexts: List<String>): Boolean {
         if (screenTexts.any { it == qNorm }) return true
-        // Префикс
         val prefix = qNorm.take(minOf(qNorm.length, 40))
-        if (prefix.length >= 10 && screenTexts.any { it.contains(prefix) || prefix.contains(it) && it.length > 20 }) return true
+        if (prefix.length >= 10 && screenTexts.any { it.contains(prefix) || (prefix.contains(it) && it.length > 20) }) return true
         return false
     }
 
