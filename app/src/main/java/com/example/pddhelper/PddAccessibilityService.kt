@@ -5,7 +5,6 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
-import android.util.Log
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
@@ -13,7 +12,11 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
+import java.io.File
 import java.io.InputStreamReader
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class PddAccessibilityService : AccessibilityService() {
 
@@ -21,15 +24,13 @@ class PddAccessibilityService : AccessibilityService() {
     private var dotView: View? = null
     private var questions: List<PddQuestion> = emptyList()
 
-    private data class TextNode(
-        val norm: String,
-        val rect: Rect
-    )
+    private data class TextNode(val norm: String, val rect: Rect)
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         loadDatabase()
+        log("Сервис запущен, загружено вопросов: ${questions.size}")
     }
 
     private fun loadDatabase() {
@@ -38,15 +39,12 @@ class PddAccessibilityService : AccessibilityService() {
                 val reader = InputStreamReader(input)
                 val type = object : TypeToken<List<PddQuestion>>() {}.type
                 questions = Gson().fromJson(reader, type)
-                Log.d(TAG, "Загружено вопросов: ${questions.size}")
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Ошибка загрузки базы: ${e.message}")
+            log("ОШИБКА загрузки базы: ${e.message}")
         }
     }
 
-    // Нормализация текста: нижний регистр, ё→е, без знаков, схлопнутые пробелы,
-    // без ведущего номера ("1 ", "2 ", ...)
     private fun normalizeText(text: String): String {
         var s = text.lowercase()
             .replace("ё", "е")
@@ -76,14 +74,16 @@ class PddAccessibilityService : AccessibilityService() {
         }
         val screenTexts = textNodes.map { it.norm }
 
-        // Ищем ВСЕ вопросы, у которых и текст, и все ответы есть на экране
+        if (screenTexts.isEmpty()) {
+            hideDot()
+            return
+        }
+
         val candidates = mutableListOf<PddQuestion>()
         for (q in questions) {
             val nq = normalizeText(q.question)
             if (nq.length < 10) continue
-
             if (!questionMatches(nq, screenTexts)) continue
-
             val allAnswersOnScreen = q.answers.all { a ->
                 val na = normalizeText(a)
                 na.isNotEmpty() && screenTexts.any { it == na }
@@ -91,49 +91,50 @@ class PddAccessibilityService : AccessibilityService() {
             if (allAnswersOnScreen) candidates.add(q)
         }
 
-        Log.d(TAG, "Кандидатов: ${candidates.size}")
-        candidates.forEach { Log.d(TAG, "  кандидат: '${it.question}' -> '${it.correct_answer}'") }
+        if (candidates.isEmpty()) {
+            hideDot()
+            return
+        }
 
-        // Правильные ответы у всех кандидатов должны совпадать
+        // Логируем, что нашли
+        val sb = StringBuilder()
+        sb.append("=== ${SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())} ===\n")
+        sb.append("Экран (первые 8 строк):\n")
+        screenTexts.take(8).forEach { sb.append("  · $it\n") }
+        sb.append("Кандидатов: ${candidates.size}\n")
+        candidates.forEach { sb.append("  ▶ '${it.question}' -> '${it.correct_answer}'\n") }
+
         val distinctCorrect = candidates.map { normalizeText(it.correct_answer) }.distinct()
         if (distinctCorrect.size != 1) {
-            Log.d(TAG, "Неоднозначно (${distinctCorrect.size} разных ответов), пропускаем")
+            sb.append("Неоднозначно (${distinctCorrect.size} разных ответов) — пропуск\n\n")
+            log(sb.toString())
             hideDot()
             return
         }
 
         val correctNorm = distinctCorrect[0]
-        if (correctNorm.isEmpty()) {
-            hideDot()
-            return
-        }
-
-        // Ищем текст правильного ответа, берём самый верхний
         val correctNode = textNodes
             .filter { it.norm == correctNorm }
             .minByOrNull { it.rect.top }
 
         if (correctNode == null) {
-            Log.d(TAG, "Не нашли текст ответа '$correctNorm' на экране")
+            sb.append("Текст ответа '$correctNorm' не найден на экране\n\n")
+            log(sb.toString())
             hideDot()
             return
         }
 
-        Log.d(TAG, "OK: правильный ответ '$correctNorm', позиция ${correctNode.rect}")
+        sb.append("ВЫБРАНО: '$correctNorm' @ ${correctNode.rect}\n\n")
+        log(sb.toString())
         showDot(correctNode.rect)
     }
 
-    // Совпадение вопроса: сначала полное, затем по длинному префиксу
     private fun questionMatches(qNorm: String, screenTexts: List<String>): Boolean {
-        // 1. Полное совпадение
         if (screenTexts.any { it == qNorm }) return true
-
-        // 2. Совпадение по длинному префиксу (60 символов)
         if (qNorm.length >= 60) {
             val prefix = qNorm.take(60)
             if (screenTexts.any { it.contains(prefix) }) return true
         }
-
         return false
     }
 
@@ -145,7 +146,6 @@ class PddAccessibilityService : AccessibilityService() {
 
     private fun showDot(rect: Rect) {
         val dotSize = 10
-
         if (dotView == null) {
             dotView = View(this).apply {
                 background = GradientDrawable().apply {
@@ -163,7 +163,6 @@ class PddAccessibilityService : AccessibilityService() {
             params.gravity = Gravity.TOP or Gravity.START
             windowManager.addView(dotView, params)
         }
-
         val params = dotView?.layoutParams as WindowManager.LayoutParams
         params.x = rect.left - 18
         params.y = rect.centerY() - dotSize / 2
@@ -180,8 +179,20 @@ class PddAccessibilityService : AccessibilityService() {
     override fun onInterrupt() { hideDot() }
     override fun onDestroy() { super.onDestroy(); hideDot() }
 
+    // ============ ЛОГ В ФАЙЛ ============
+    private fun log(text: String) {
+        try {
+            val file = File(getExternalFilesDir(null), "pdd_log.txt")
+            // Обрезаем файл, если стал больше 200 КБ
+            if (file.exists() && file.length() > 200_000) {
+                file.writeText("")
+            }
+            file.appendText(text)
+        } catch (_: Exception) {}
+    }
+
     companion object {
-        private const val TAG = "PDD"
+        const val LOG_FILENAME = "pdd_log.txt"
     }
 }
 
