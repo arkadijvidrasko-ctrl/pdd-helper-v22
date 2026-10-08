@@ -1,19 +1,26 @@
 package com.example.pddhelper
 
 import android.accessibilityservice.AccessibilityService
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.util.TypedValue
+import android.view.Display
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.TextView
+import com.google.android.gms.tasks.Task
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import java.io.File
 import java.io.InputStreamReader
 import java.text.SimpleDateFormat
@@ -27,7 +34,12 @@ class PddAccessibilityService : AccessibilityService() {
     private var questions: List<PddQuestion> = emptyList()
     private var ambiguousQuestionKeys: Set<String> = emptySet()
 
+    private val textRecognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+    private var lastOcrTime = 0L
+    private var ocrInProgress = false
+
     private data class TextNode(val node: AccessibilityNodeInfo, val norm: String, val rect: Rect)
+    private data class OcrLine(val norm: String, val rect: Rect)
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -70,16 +82,7 @@ class PddAccessibilityService : AccessibilityService() {
         if (event.packageName == packageName) return
 
         val root = rootInActiveWindow
-        if (root == null) {
-            // Диагностика: возможно защита
-            val sb = StringBuilder()
-            sb.append("\n=== ${SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())} ===\n")
-            sb.append("Пакет: ${event.packageName}\n")
-            sb.append("root = null (возможна защита или нет активного окна)\n")
-            logLine(sb.toString())
-            hideBadge()
-            return
-        }
+        if (root == null) { hideBadge(); return }
 
         val allNodes = mutableListOf<AccessibilityNodeInfo>()
         traverseNode(root, allNodes)
@@ -97,35 +100,138 @@ class PddAccessibilityService : AccessibilityService() {
         }
         val screenTexts = textNodes.map { it.norm }
 
-        // === Диагностика: если текстов нет, но узлы есть ===
-        if (screenTexts.isEmpty()) {
-            val sb = StringBuilder()
-            sb.append("\n=== ${SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())} ===\n")
-            sb.append("Пакет: ${event.packageName}\n")
-            sb.append("Узлов: ${allNodes.size}, текстовых: 0\n")
-            sb.append("Причина: текст не читается через accessibility.\n")
-            sb.append("Возможные защиты:\n")
-            sb.append("  • FLAG_SECURE на окне\n")
-            sb.append("  • WebView без accessibility\n")
-            sb.append("  • Canvas/SurfaceView\n")
-            sb.append("  • Кастомные View без text\n")
+        if (screenTexts.isNotEmpty()) {
+            // Обычный путь: текст читается через accessibility
+            processScreen(event.packageName, textNodes.map { it.norm to it.rect })
+            return
+        }
 
-            // Смотрим, что есть в узлах: contentDescription, viewIdResourceName, className
-            sb.append("Первые 15 узлов (className / viewId / contentDesc / text):\n")
-            allNodes.take(15).forEachIndexed { idx, n ->
-                val cn = n.className?.toString() ?: "?"
-                val vid = n.viewIdResourceName ?: "-"
-                val cd = n.contentDescription?.toString() ?: "-"
-                val tx = n.text?.toString() ?: "-"
-                sb.append("  [$idx] $cn | $vid | cd='$cd' | text='$tx'\n")
+        // Текст не читается — пробуем OCR
+        tryOcr(event.packageName)
+    }
+
+    // === Обычная логика (по accessibility) ===
+    private fun processScreen(pkg: String, lines: List<Pair<String, Rect>>) {
+        val screenTexts = lines.map { it.first }
+        val candidates = findCandidates(screenTexts)
+        if (candidates.isEmpty()) { hideBadge(); return }
+
+        val distinctCorrect = candidates.map { normalizeText(it.correct_answer) }.distinct()
+        if (distinctCorrect.size != 1) { hideBadge(); return }
+        val correctNorm = distinctCorrect[0]
+
+        val correctLine = lines
+            .filter { it.first == correctNorm }
+            .minByOrNull { it.second.top } ?: run { hideBadge(); return }
+
+        val answerNumber = findAnswerNumberFromTexts(correctLine.second, lines)
+        val pos = Pair(correctLine.second.left - 36, correctLine.second.centerY() - 15)
+        showBadge(answerNumber, pos.first, pos.second)
+    }
+
+    // === OCR-путь ===
+    private fun tryOcr(pkg: String) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            hideBadge()
+            return
+        }
+        val now = System.currentTimeMillis()
+        if (ocrInProgress || now - lastOcrTime < 1500) return
+        lastOcrTime = now
+        ocrInProgress = true
+
+        takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor,
+            object : TakeScreenshotCallback {
+                override fun onSuccess(screenshot: ScreenshotResult) {
+                    val bitmap = Bitmap.wrapHardwareBuffer(
+                        screenshot.hardwareBuffer, screenshot.colorSpace
+                    )
+                    screenshot.hardwareBuffer.close()
+                    if (bitmap == null) {
+                        ocrInProgress = false
+                        hideBadge()
+                        return
+                    }
+                    runOcr(bitmap, pkg)
+                }
+
+                override fun onFailure(errorCode: Int) {
+                    ocrInProgress = false
+                    logLine("takeScreenshot failed: $errorCode")
+                    hideBadge()
+                }
+            })
+    }
+
+    private fun runOcr(bitmap: Bitmap, pkg: String) {
+        val image = InputImage.fromBitmap(bitmap, 0)
+        textRecognizer.process(image)
+            .addOnSuccessListener { visionText ->
+                ocrInProgress = false
+                val lines = mutableListOf<Pair<String, Rect>>()
+                for (block in visionText.textBlocks) {
+                    for (line in block.lines) {
+                        val r = line.boundingBox ?: continue
+                        val norm = normalizeText(line.text)
+                        if (norm.length < 2) continue
+                        lines.add(norm to r)
+                    }
+                }
+                processOcrResult(pkg, lines)
             }
+            .addOnFailureListener { e ->
+                ocrInProgress = false
+                logLine("OCR error: ${e.message}")
+                hideBadge()
+            }
+    }
+
+    private fun processOcrResult(pkg: String, lines: List<Pair<String, Rect>>) {
+        val sb = StringBuilder()
+        sb.append("\n=== ${SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())} ===\n")
+        sb.append("Пакет: $pkg (OCR)\n")
+        sb.append("Распознано строк: ${lines.size}\n")
+        lines.take(15).forEach { sb.append("   · '${it.first}' @ ${it.second}\n") }
+
+        if (lines.isEmpty()) {
+            sb.append("OCR пуст\n")
             logLine(sb.toString())
             hideBadge()
             return
         }
 
-        // === Поиск кандидатов ===
-        val candidates = mutableListOf<PddQuestion>()
+        val screenTexts = lines.map { it.first }
+        val candidates = findCandidates(screenTexts)
+        sb.append("Кандидатов: ${candidates.size}\n")
+        candidates.forEach { sb.append("   ▶ '${it.question}' → '${it.correct_answer}'\n") }
+
+        if (candidates.isEmpty()) { logLine(sb.toString()); hideBadge(); return }
+
+        val distinctCorrect = candidates.map { normalizeText(it.correct_answer) }.distinct()
+        if (distinctCorrect.size != 1) { logLine(sb.toString()); hideBadge(); return }
+        val correctNorm = distinctCorrect[0]
+
+        val correctLine = lines
+            .filter { it.first == correctNorm }
+            .minByOrNull { it.second.top }
+        if (correctLine == null) {
+            sb.append("Не нашли '$correctNorm' среди OCR-строк\n")
+            logLine(sb.toString())
+            hideBadge()
+            return
+        }
+
+        val answerNumber = findAnswerNumberFromTexts(correctLine.second, lines)
+        sb.append("ВЫБРАНО: '$correctNorm', номер: $answerNumber @ ${correctLine.second}\n")
+        logLine(sb.toString())
+
+        val pos = Pair(correctLine.second.left - 36, correctLine.second.centerY() - 15)
+        showBadge(answerNumber, pos.first, pos.second)
+    }
+
+    // Общий поиск кандидатов по списку нормализованных строк
+    private fun findCandidates(screenTexts: List<String>): List<PddQuestion> {
+        val out = mutableListOf<PddQuestion>()
         for (q in questions) {
             val nq = normalizeText(q.question)
             if (nq.length < 10) continue
@@ -133,82 +239,35 @@ class PddAccessibilityService : AccessibilityService() {
             if (!questionMatches(nq, screenTexts)) continue
             val allAnswersOnScreen = q.answers.all { a ->
                 val na = normalizeText(a)
-                na.isNotEmpty() && screenTexts.any { it == na }
+                na.isNotEmpty() && screenTexts.any { it == na || it.contains(na) || na.contains(it) && it.length > 8 }
             }
-            if (allAnswersOnScreen) candidates.add(q)
+            if (allAnswersOnScreen) out.add(q)
         }
-
-        if (candidates.isEmpty()) { hideBadge(); return }
-
-        val distinctCorrect = candidates.map { normalizeText(it.correct_answer) }.distinct()
-        if (distinctCorrect.size != 1) { hideBadge(); return }
-
-        val correctNorm = distinctCorrect[0]
-        val correctNode = textNodes
-            .filter { it.norm == correctNorm }
-            .minByOrNull { it.rect.top }
-
-        if (correctNode == null) { hideBadge(); return }
-
-        val answerNumber = findAnswerNumber(correctNode, allNodes)
-        val pos = findBadgePosition(correctNode)
-
-        val sb = StringBuilder()
-        sb.append("\n=== ${SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())} ===\n")
-        sb.append("Пакет: ${event.packageName}\n")
-        sb.append("Вопрос: '${candidates.first().question}'\n")
-        sb.append("Правильный: '$correctNorm' под номером $answerNumber\n")
-        sb.append("Позиция бейджа: ($pos)\n")
-        logLine(sb.toString())
-
-        showBadge(answerNumber, pos.first, pos.second)
-    }
-
-    private fun findAnswerNumber(correct: TextNode, allNodes: List<AccessibilityNodeInfo>): String {
-        var bestNum: String? = null
-        var bestDist = Int.MAX_VALUE
-        for (n in allNodes) {
-            val t = n.text?.toString()?.trim() ?: continue
-            if (!t.matches(Regex("^\\d+\\.?$"))) continue
-            val r = Rect()
-            n.getBoundsInScreen(r)
-            if (r.width() <= 0) continue
-            if (r.centerY() > correct.rect.centerY() + 20) continue
-            val dist = correct.rect.left - r.right
-            if (dist in 0..200 && dist < bestDist) {
-                bestDist = dist
-                bestNum = t.replace(".", "").trim()
-            }
-        }
-        return bestNum ?: "?"
-    }
-
-    private fun findBadgePosition(correct: TextNode): Pair<Int, Int> {
-        val size = 30
-        val parent = correct.node.parent
-        if (parent != null) {
-            var leftmost = correct.rect.left
-            for (i in 0 until parent.childCount) {
-                val sib = parent.getChild(i) ?: continue
-                val t = sib.text?.toString()?.trim() ?: continue
-                if (t.matches(Regex("^\\d+\\.?$"))) {
-                    val r = Rect()
-                    sib.getBoundsInScreen(r)
-                    if (r.width() > 0 && r.left < leftmost) leftmost = r.left
-                }
-            }
-            return Pair(leftmost - size - 6, correct.rect.centerY() - size / 2)
-        }
-        return Pair(correct.rect.left - size - 6, correct.rect.centerY() - size / 2)
+        return out
     }
 
     private fun questionMatches(qNorm: String, screenTexts: List<String>): Boolean {
         if (screenTexts.any { it == qNorm }) return true
-        if (qNorm.length >= 60) {
-            val prefix = qNorm.take(60)
-            if (screenTexts.any { it.contains(prefix) }) return true
-        }
+        // Префикс
+        val prefix = qNorm.take(minOf(qNorm.length, 40))
+        if (prefix.length >= 10 && screenTexts.any { it.contains(prefix) || prefix.contains(it) && it.length > 20 }) return true
         return false
+    }
+
+    private fun findAnswerNumberFromTexts(answerRect: Rect, lines: List<Pair<String, Rect>>): String {
+        var bestNum: String? = null
+        var bestDist = Int.MAX_VALUE
+        for ((text, rect) in lines) {
+            if (!text.matches(Regex("^\\d+$"))) continue
+            if (rect.centerY() > answerRect.centerY() + 25) continue
+            if (rect.centerY() < answerRect.centerY() - 25) continue
+            val dist = answerRect.left - rect.right
+            if (dist in -100..300 && dist < bestDist) {
+                bestDist = dist
+                bestNum = text
+            }
+        }
+        return bestNum ?: "?"
     }
 
     private fun traverseNode(node: AccessibilityNodeInfo?, out: MutableList<AccessibilityNodeInfo>) {
@@ -226,7 +285,7 @@ class PddAccessibilityService : AccessibilityService() {
                 gravity = Gravity.CENTER
                 background = GradientDrawable().apply {
                     shape = GradientDrawable.OVAL
-                    setColor(Color.parseColor("#888888")) // серый
+                    setColor(Color.parseColor("#888888"))
                 }
             }
             val params = WindowManager.LayoutParams(
@@ -256,7 +315,11 @@ class PddAccessibilityService : AccessibilityService() {
     }
 
     override fun onInterrupt() { hideBadge() }
-    override fun onDestroy() { super.onDestroy(); hideBadge() }
+    override fun onDestroy() {
+        super.onDestroy()
+        try { textRecognizer.close() } catch (_: Exception) {}
+        hideBadge()
+    }
 
     private fun logLine(text: String) {
         try {
