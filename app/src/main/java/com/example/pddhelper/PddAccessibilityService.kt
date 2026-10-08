@@ -1,8 +1,11 @@
 package com.example.pddhelper
 
 import android.accessibilityservice.AccessibilityService
+import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
+import android.graphics.drawable.GradientDrawable
+import android.util.Log
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
@@ -18,6 +21,13 @@ class PddAccessibilityService : AccessibilityService() {
     private var dotView: View? = null
     private var questions: List<PddQuestion> = emptyList()
 
+    // Один текстовый узел на экране
+    private data class TextNode(
+        val node: AccessibilityNodeInfo,
+        val norm: String,
+        val rect: Rect
+    )
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
@@ -26,90 +36,111 @@ class PddAccessibilityService : AccessibilityService() {
 
     private fun loadDatabase() {
         try {
-            val inputStream = assets.open("questions.json")
-            val reader = InputStreamReader(inputStream)
-            val type = object : TypeToken<List<PddQuestion>>() {}.type
-            questions = Gson().fromJson(reader, type)
-            android.util.Log.d("PDD", "Загружено вопросов: ${questions.size}")
+            assets.open("questions.json").use { input ->
+                val reader = InputStreamReader(input)
+                val type = object : TypeToken<List<PddQuestion>>() {}.type
+                questions = Gson().fromJson(reader, type)
+                Log.d(TAG, "Загружено вопросов: ${questions.size}")
+            }
         } catch (e: Exception) {
-            android.util.Log.e("PDD", "Ошибка загрузки базы: ${e.message}")
+            Log.e(TAG, "Ошибка загрузки базы: ${e.message}")
         }
     }
 
     private fun normalizeText(text: String): String {
         return text.lowercase()
-            .replace(Regex("[^a-zа-яё0-9 ]"), "")
+            .replace("ё", "е")
+            .replace(Regex("[^a-zа-я0-9 ]"), "")
             .replace(Regex("\\s+"), " ")
             .trim()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        val rootNode = rootInActiveWindow ?: return
+        val root = rootInActiveWindow ?: return
 
+        // 1. Собираем все текстовые узлы (только листья, без контейнеров)
         val allNodes = mutableListOf<AccessibilityNodeInfo>()
-        traverseNode(rootNode, allNodes)
+        traverseNode(root, allNodes)
 
-        // Собираем нормализованные тексты всех узлов
-        val screenTexts = allNodes.mapNotNull { node ->
-            val text = node.text?.toString()?.let { normalizeText(it) }
-            if (text.isNullOrEmpty()) null else text
+        val textNodes = mutableListOf<TextNode>()
+        for (n in allNodes) {
+            if (n.childCount > 0) continue
+            val raw = n.text?.toString() ?: continue
+            val norm = normalizeText(raw)
+            if (norm.isEmpty()) continue
+            val r = Rect()
+            n.getBoundsInScreen(r)
+            if (r.width() <= 0 || r.height() <= 0) continue
+            textNodes.add(TextNode(n, norm, r))
         }
 
-        // Ищем совпадение по вопросу + ответам
-        var matchedQuestion: PddQuestion? = null
+        val screenTexts = textNodes.map { it.norm }
 
-        for (question in questions) {
-            val normQuestion = normalizeText(question.question)
-            if (normQuestion.isEmpty()) continue
+        // 2. Ищем кандидатов: вопрос совпал по началу + все ответы есть на экране
+        val candidates = mutableListOf<PddQuestion>()
+        for (q in questions) {
+            val nq = normalizeText(q.question)
+            if (nq.length < 8) continue
 
-            // Есть ли текст вопроса на экране?
-            if (!screenTexts.any { it == normQuestion }) continue
+            if (!questionOnScreen(nq, screenTexts)) continue
 
-            // Есть ли ВСЕ варианты ответов этого вопроса на экране?
-            val allAnswersFound = question.answers.all { answer ->
-                val normAnswer = normalizeText(answer)
-                normAnswer.isNotEmpty() && screenTexts.any { it == normAnswer }
+            val allAnswersFound = q.answers.all { a ->
+                val na = normalizeText(a)
+                na.isNotEmpty() && screenTexts.any { it == na }
             }
-
-            if (allAnswersFound) {
-                matchedQuestion = question
-                break
-            }
+            if (allAnswersFound) candidates.add(q)
         }
 
-        // Если совпадение найдено — ищем координаты правильного ответа
-        if (matchedQuestion != null) {
-            val correctAnswerNorm = normalizeText(matchedQuestion.correct_answer)
-            val correctNode = allNodes.find {
-                normalizeText(it.text?.toString() ?: "") == correctAnswerNorm
-            }
-
-            if (correctNode != null) {
-                val rect = Rect()
-                correctNode.getBoundsInScreen(rect)
-                showDot(rect)
-                return
-            }
+        // 3. Если у кандидатов разные правильные ответы — не показываем ничего
+        val distinctCorrect = candidates.map { normalizeText(it.correct_answer) }.distinct()
+        if (distinctCorrect.size != 1) {
+            hideDot()
+            return
         }
 
-        hideDot()
+        val correctNorm = distinctCorrect[0]
+
+        // 4. Ищем узел правильного ответа, берём самый верхний
+        val correctNode = textNodes.filter { it.norm == correctNorm }
+            .minByOrNull { it.rect.top }
+
+        if (correctNode == null) {
+            hideDot()
+            return
+        }
+
+        Log.d(TAG, "OK: '${candidates.first().question}' -> '${correctNorm}'")
+        showDot(correctNode.rect)
     }
 
-    private fun traverseNode(node: AccessibilityNodeInfo?, nodes: MutableList<AccessibilityNodeInfo>) {
+    // Проверяем, есть ли текст вопроса на экране (по началу)
+    private fun questionOnScreen(qNorm: String, screenTexts: List<String>): Boolean {
+        // Полное совпадение
+        if (screenTexts.any { it == qNorm }) return true
+        // Префикс: если какой-то узел содержит первые 25 символов вопроса
+        val prefix = qNorm.take(25)
+        if (prefix.length < 8) return false
+        return screenTexts.any { it.contains(prefix) }
+    }
+
+    private fun traverseNode(node: AccessibilityNodeInfo?, out: MutableList<AccessibilityNodeInfo>) {
         if (node == null) return
-        nodes.add(node)
-        for (i in 0 until node.childCount) {
-            traverseNode(node.getChild(i), nodes)
-        }
+        out.add(node)
+        for (i in 0 until node.childCount) traverseNode(node.getChild(i), out)
     }
 
     private fun showDot(rect: Rect) {
+        val dotSize = 10  // маленький кружок 10x10 px
+
         if (dotView == null) {
             dotView = View(this).apply {
-                setBackgroundColor(android.graphics.Color.GREEN)
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    setColor(Color.parseColor("#888888")) // серый
+                }
             }
             val params = WindowManager.LayoutParams(
-                20, 20,
+                dotSize, dotSize,
                 WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                         WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
@@ -120,20 +151,25 @@ class PddAccessibilityService : AccessibilityService() {
         }
 
         val params = dotView?.layoutParams as WindowManager.LayoutParams
-        params.x = rect.left - 30
-        params.y = rect.centerY() - 10
+        // Точка слева от текста ответа, по вертикальному центру строки
+        params.x = rect.left - 18
+        params.y = rect.centerY() - dotSize / 2
         windowManager.updateViewLayout(dotView, params)
     }
 
     private fun hideDot() {
         if (dotView != null) {
-            try { windowManager.removeView(dotView) } catch (e: Exception) {}
+            try { windowManager.removeView(dotView) } catch (_: Exception) {}
             dotView = null
         }
     }
 
     override fun onInterrupt() { hideDot() }
     override fun onDestroy() { super.onDestroy(); hideDot() }
+
+    companion object {
+        private const val TAG = "PDD"
+    }
 }
 
 data class PddQuestion(
