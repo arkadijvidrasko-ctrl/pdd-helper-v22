@@ -24,13 +24,17 @@ class PddAccessibilityService : AccessibilityService() {
     private var dotView: View? = null
     private var questions: List<PddQuestion> = emptyList()
 
+    // Набор «текстов вопросов, по которым в базе разные правильные ответы» —
+    // для таких вопросов мы молчим, чтобы не соврать.
+    private var ambiguousQuestionKeys: Set<String> = emptySet()
+
     private data class TextNode(val norm: String, val rect: Rect)
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         loadDatabase()
-        log("Сервис запущен, загружено вопросов: ${questions.size}")
+        log("Сервис запущен. Вопросов: ${questions.size}, неоднозначных: ${ambiguousQuestionKeys.size}")
     }
 
     private fun loadDatabase() {
@@ -40,6 +44,14 @@ class PddAccessibilityService : AccessibilityService() {
                 val type = object : TypeToken<List<PddQuestion>>() {}.type
                 questions = Gson().fromJson(reader, type)
             }
+            // Считаем неоднозначные вопросы: те, у которых одинаковый вопрос, но разные ответы
+            val byQuestion = questions.groupBy { normalizeText(it.question) }
+            val ambiguous = mutableSetOf<String>()
+            for ((q, list) in byQuestion) {
+                val corrects = list.map { normalizeText(it.correct_answer) }.distinct()
+                if (corrects.size > 1) ambiguous.add(q)
+            }
+            ambiguousQuestionKeys = ambiguous
         } catch (e: Exception) {
             log("ОШИБКА загрузки базы: ${e.message}")
         }
@@ -83,6 +95,7 @@ class PddAccessibilityService : AccessibilityService() {
         for (q in questions) {
             val nq = normalizeText(q.question)
             if (nq.length < 10) continue
+            if (ambiguousQuestionKeys.contains(nq)) continue  // неоднозначный — не трогаем
             if (!questionMatches(nq, screenTexts)) continue
             val allAnswersOnScreen = q.answers.all { a ->
                 val na = normalizeText(a)
@@ -96,17 +109,17 @@ class PddAccessibilityService : AccessibilityService() {
             return
         }
 
-        // Логируем, что нашли
         val sb = StringBuilder()
         sb.append("=== ${SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())} ===\n")
-        sb.append("Экран (первые 8 строк):\n")
-        screenTexts.take(8).forEach { sb.append("  · $it\n") }
+        sb.append("Экран (до 10 строк):\n")
+        screenTexts.take(10).forEach { sb.append("  · $it\n") }
         sb.append("Кандидатов: ${candidates.size}\n")
         candidates.forEach { sb.append("  ▶ '${it.question}' -> '${it.correct_answer}'\n") }
 
+        // Если у кандидатов разные правильные ответы — молчим
         val distinctCorrect = candidates.map { normalizeText(it.correct_answer) }.distinct()
         if (distinctCorrect.size != 1) {
-            sb.append("Неоднозначно (${distinctCorrect.size} разных ответов) — пропуск\n\n")
+            sb.append("Неоднозначно (${distinctCorrect.size} разных), пропуск\n\n")
             log(sb.toString())
             hideDot()
             return
@@ -118,7 +131,7 @@ class PddAccessibilityService : AccessibilityService() {
             .minByOrNull { it.rect.top }
 
         if (correctNode == null) {
-            sb.append("Текст ответа '$correctNorm' не найден на экране\n\n")
+            sb.append("Ответ '$correctNorm' не найден на экране\n\n")
             log(sb.toString())
             hideDot()
             return
@@ -126,7 +139,13 @@ class PddAccessibilityService : AccessibilityService() {
 
         sb.append("ВЫБРАНО: '$correctNorm' @ ${correctNode.rect}\n\n")
         log(sb.toString())
-        showDot(correctNode.rect)
+
+        // Точка слева от цифры ответа, по верху первой строки
+        val r = correctNode.rect
+        val dotSize = 12
+        val x = r.left - dotSize - 8       // 8px отступ от начала текста
+        val y = r.top + 10                 // чуть ниже верха строки — примерно центр цифры
+        showDot(x, y, dotSize)
     }
 
     private fun questionMatches(qNorm: String, screenTexts: List<String>): Boolean {
@@ -144,8 +163,7 @@ class PddAccessibilityService : AccessibilityService() {
         for (i in 0 until node.childCount) traverseNode(node.getChild(i), out)
     }
 
-    private fun showDot(rect: Rect) {
-        val dotSize = 10
+    private fun showDot(x: Int, y: Int, size: Int) {
         if (dotView == null) {
             dotView = View(this).apply {
                 background = GradientDrawable().apply {
@@ -154,7 +172,7 @@ class PddAccessibilityService : AccessibilityService() {
                 }
             }
             val params = WindowManager.LayoutParams(
-                dotSize, dotSize,
+                size, size,
                 WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                         WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
@@ -164,8 +182,10 @@ class PddAccessibilityService : AccessibilityService() {
             windowManager.addView(dotView, params)
         }
         val params = dotView?.layoutParams as WindowManager.LayoutParams
-        params.x = rect.left - 18
-        params.y = rect.centerY() - dotSize / 2
+        params.width = size
+        params.height = size
+        params.x = x
+        params.y = y
         windowManager.updateViewLayout(dotView, params)
     }
 
@@ -179,14 +199,10 @@ class PddAccessibilityService : AccessibilityService() {
     override fun onInterrupt() { hideDot() }
     override fun onDestroy() { super.onDestroy(); hideDot() }
 
-    // ============ ЛОГ В ФАЙЛ ============
     private fun log(text: String) {
         try {
-            val file = File(getExternalFilesDir(null), "pdd_log.txt")
-            // Обрезаем файл, если стал больше 200 КБ
-            if (file.exists() && file.length() > 200_000) {
-                file.writeText("")
-            }
+            val file = File(getExternalFilesDir(null), LOG_FILENAME)
+            if (file.exists() && file.length() > 200_000) file.writeText("")
             file.appendText(text)
         } catch (_: Exception) {}
     }
